@@ -95,20 +95,39 @@ MatmulBackward(const std::shared_ptr<Tensor> &input, const std::shared_ptr<Tenso
     CUBLAS_CHECK(cublasCreate(&handle));
 
     const float alpha = 1.0f;
+    const float beta = 0.0f;
 
-    for (int64_t b = 0; b < grad_batches; ++b) {
-        float beta_input = (input_batches == 1 && b > 0) ? 1.0f : 0.0f;
-        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, K, M, N, &alpha,
-                                 static_cast<const float *>(other->DataPtr()) + (other_batches == 1 ? 0 : b * K * N), K,
-                                 static_cast<const float *>(grad_output->DataPtr()) + b * M * N, N, &beta_input,
-                                 static_cast<float *>(grad_input->DataPtr()) + (input_batches == 1 ? 0 : b * M * K), K));
+    // grad_input = grad_output * other^T --> grad_input^T = other * grad_output^T
+    // Dimensions: grad_input(M, K), other(K, N), grad_output(M, N)
+    // col-major: grad_input_T(K, M), other_T(N, K), grad_output_T(N, M)
+    // C(K, M) = A(K, N) * B(N, M) --> A = other_T^T, B = grad_output_T
+    CUBLAS_CHECK(cublasSgemmStridedBatched(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N, (int)K, (int)M, (int)N, &alpha, static_cast<const float *>(other->DataPtr()),
+        (int)N, (other_batches == 1 ? 0 : (long long)(K * N)), static_cast<const float *>(grad_output->DataPtr()),
+        (int)N, (long long)(M * N), &beta, static_cast<float *>(grad_input->DataPtr()), (int)K,
+        (input_batches == 1 ? 0 : (long long)(M * K)), (int)grad_batches));
 
-        float beta_other = (other_batches == 1 && b > 0) ? 1.0f : 0.0f;
-        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, K, M, &alpha,
-                                 static_cast<const float *>(grad_output->DataPtr()) + b * M * N, N,
-                                 static_cast<const float *>(input->DataPtr()) + (input_batches == 1 ? 0 : b * M * K), M,
-                                 &beta_other,
-                                 static_cast<float *>(grad_other->DataPtr()) + (other_batches == 1 ? 0 : b * K * N), N));
+    // grad_other = input^T * grad_output --> grad_other^T = grad_output^T * input
+    // Dimensions: grad_other(K, N), input(M, K), grad_output(M, N)
+    // col-major: grad_other_T(N, K), input_T(K, M), grad_output_T(N, M)
+    // C(N, K) = A(N, M) * B(M, K) --> A = grad_output_T, B = input_T^T
+    float beta_accum = 0.0f;
+    if (other_batches == 1 && grad_batches > 1) {
+        // We need to sum across batches. SgemmStridedBatched with stride 0 for C will NOT work correctly (race condition).
+        // For simplicity and safety, we use a loop here if we need to sum.
+        for (int b = 0; b < grad_batches; ++b) {
+            float cur_beta = (b == 0) ? 0.0f : 1.0f;
+            CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, (int)N, (int)K, (int)M, &alpha,
+                                     static_cast<const float *>(grad_output->DataPtr()) + b * M * N, (int)N,
+                                     static_cast<const float *>(input->DataPtr()) + (input_batches == 1 ? 0 : b * M * K),
+                                     (int)K, &cur_beta, static_cast<float *>(grad_other->DataPtr()), (int)N));
+        }
+    } else {
+        CUBLAS_CHECK(cublasSgemmStridedBatched(
+            handle, CUBLAS_OP_N, CUBLAS_OP_T, (int)N, (int)K, (int)M, &alpha,
+            static_cast<const float *>(grad_output->DataPtr()), (int)N, (long long)(M * N),
+            static_cast<const float *>(input->DataPtr()), (int)K, (input_batches == 1 ? 0 : (long long)(M * K)), &beta,
+            static_cast<float *>(grad_other->DataPtr()), (int)N, (long long)(K * N), (int)grad_batches));
     }
 
     CUBLAS_CHECK(cublasDestroy(handle));
