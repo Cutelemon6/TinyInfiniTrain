@@ -184,16 +184,32 @@ Tensor Tensor::To(Device device) {
 
     Tensor new_tensor;
     switch (device.Type()) {
-#ifdef USE_CUDA
     case DeviceType::kCPU:
-        // CUDA -> CPU
-        new_tensor = Tensor(dims_, dtype_, Device(DeviceType::kCPU, 0));
-        cudaMemcpyAsync(new_tensor.DataPtr(), DataPtr(), SizeInBytes(), cudaMemcpyDeviceToHost, 0);
+#ifdef USE_CUDA
+        if (buffer_->GetDevice().Type() == DeviceType::kCUDA) {
+            // CUDA -> CPU
+            new_tensor = Tensor(dims_, dtype_, Device(DeviceType::kCPU, 0));
+            cudaMemcpyAsync(new_tensor.DataPtr(), DataPtr(), SizeInBytes(), cudaMemcpyDeviceToHost, 0);
+        } else {
+#endif
+            // CPU -> CPU (different index or forced copy)
+            new_tensor = Tensor(dims_, dtype_, device);
+            std::memcpy(new_tensor.DataPtr(), DataPtr(), SizeInBytes());
+#ifdef USE_CUDA
+        }
+#endif
         break;
+#ifdef USE_CUDA
     case DeviceType::kCUDA:
-        // CPU -> CUDA
-        new_tensor = Tensor(dims_, dtype_, Device(DeviceType::kCUDA, 0));
-        cudaMemcpyAsync(new_tensor.DataPtr(), DataPtr(), SizeInBytes(), cudaMemcpyHostToDevice, 0);
+        if (buffer_->GetDevice().Type() == DeviceType::kCPU) {
+            // CPU -> CUDA
+            new_tensor = Tensor(dims_, dtype_, Device(DeviceType::kCUDA, 0));
+            cudaMemcpyAsync(new_tensor.DataPtr(), DataPtr(), SizeInBytes(), cudaMemcpyHostToDevice, 0);
+        } else {
+            // CUDA -> CUDA (different index or forced copy)
+            new_tensor = Tensor(dims_, dtype_, device);
+            cudaMemcpyAsync(new_tensor.DataPtr(), DataPtr(), SizeInBytes(), cudaMemcpyDeviceToDevice, 0);
+        }
         break;
 #endif
     default:
@@ -277,13 +293,29 @@ std::shared_ptr<Tensor> Tensor::Contiguous() {
 }
 
 std::shared_ptr<Tensor> Tensor::Flatten(int64_t start, int64_t end) {
-    // return Contiguous()->View(new_shape);
-    // =================================== 作业 ===================================
-    // TODO：实现张量扁平化操作，将指定维度范围[start, end]内的所有维度合并为一个维度
-    // HINT:
-    // =================================== 作业 ===================================
+    if (start < 0)
+        start += dims_.size();
+    if (end < 0)
+        end += dims_.size();
+    CHECK_GE(start, 0);
+    CHECK_LT(start, dims_.size());
+    CHECK_GE(end, start);
+    CHECK_LT(end, dims_.size());
 
-    return std::make_shared<Tensor>();
+    std::vector<int64_t> new_shape;
+    for (int i = 0; i < start; ++i) {
+        new_shape.push_back(dims_[i]);
+    }
+    int64_t flattened_dim = 1;
+    for (int i = start; i <= end; ++i) {
+        flattened_dim *= dims_[i];
+    }
+    new_shape.push_back(flattened_dim);
+    for (size_t i = end + 1; i < dims_.size(); ++i) {
+        new_shape.push_back(dims_[i]);
+    }
+
+    return Contiguous()->View(new_shape);
 }
 
 std::shared_ptr<Tensor> Tensor::Squeeze(int64_t dim) {
@@ -354,10 +386,28 @@ std::shared_ptr<Tensor> Tensor::RequiresGrad() {
 }
 
 void Tensor::Backward(std::shared_ptr<Tensor> gradient, bool retain_graph, bool create_graph) const {
-    // =================================== 作业 ===================================
-    // TODO：实现自动微分反向传播
-    // 功能描述：1. 计算当前张量对叶子节点的梯度    2. 支持多输出场景的梯度累加
-    // =================================== 作业 ===================================
+    if (!requires_grad_) {
+        return;
+    }
+
+    if (!gradient) {
+        if (num_elements_ == 1) {
+            gradient = std::make_shared<Tensor>(dims_, dtype_, GetDevice());
+            gradient->Fill<float>(1.0f);
+        } else {
+            LOG(FATAL) << "grad can be implicitly created only for scalar outputs";
+        }
+    }
+
+    if (grad_fn_) {
+        grad_fn_->BackwardPartial(gradient, output_idx_);
+    } else if (is_leaf_) {
+        if (grad_) {
+            auto device = grad_->GetDevice().Type();
+            auto kernel = Dispatcher::Instance().GetKernel({device, "AccumulateGrad"});
+            kernel.Call<void>(gradient, 1.0f, grad_);
+        }
+    }
 }
 
 void Tensor::ZeroGrad() {

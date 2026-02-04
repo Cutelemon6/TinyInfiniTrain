@@ -69,22 +69,33 @@ int SampleMult(float *probabilities, int n, float coin) {
 }
 
 Tokenizer::Tokenizer(const std::string &filepath) {
-    /* ===================================== 作业 =====================================
-    TODO：实现Tokenizer二进制文件加载
+    std::ifstream ifs(filepath, std::ios::binary);
+    CHECK(ifs.is_open()) << "Failed to open file: " << filepath;
 
-    文件格式说明：
-    ----------------------------------------------------------------------------------
-    | HEADER (1024 bytes)                     | VOCAB TABLE                           |
-    | magic(4B) | version(4B) | vocab_size(4B) | reserved(1012B) | token词表数据       |
-    ----------------------------------------------------------------------------------
-    ===================================== 作业 ===================================== */
+    auto header_bytes = ReadSeveralBytesFromIfstream(1024, &ifs);
+    uint32_t magic = BytesToType<uint32_t>(header_bytes, 0);
+    uint32_t version = BytesToType<uint32_t>(header_bytes, 4);
+    uint32_t vocab_size = BytesToType<uint32_t>(header_bytes, 8);
+
+    magic_number_ = magic;
+    vocab_size_ = vocab_size;
+    eot_token_ = kEotMap.at(magic);
+
+    token_table_.resize(vocab_size);
+    for (uint32_t i = 0; i < vocab_size; ++i) {
+        uint8_t len;
+        ifs.read(reinterpret_cast<char *>(&len), 1);
+        std::vector<char> buf(len);
+        ifs.read(buf.data(), len);
+        token_table_[i] = std::string(buf.begin(), buf.end());
+    }
+    ifs.close();
 }
 
 std::string Tokenizer::Decode(uint32_t token_id) const {
-    /* ===================================== 作业 =====================================
-    TODO：实现token_id到文本的转换
-    功能描述：根据token_id返回对应的文本片段
-    ===================================== 作业 ===================================== */
+    if (token_id < token_table_.size()) {
+        return token_table_[token_id];
+    }
     return "";
 }
 
@@ -95,22 +106,49 @@ void Tokenizer::GenerateText(infini_train::nn::Module &model, uint32_t batch_siz
     // x_tensor (FLAGS_batch_size, FLAGS_sequence_length) eq:(4, 64)
     infini_train::Tensor x_tensor = infini_train::Tensor(dims, DataType::kINT64);
     int64_t *x_buff = static_cast<int64_t *>(x_tensor.DataPtr());
-    for (int i = 0; i < batch_size * sequence_length; ++i) { x_buff[i] = eot_token_; }
+    for (int i = 0; i < batch_size * sequence_length; ++i) {
+        x_buff[i] = eot_token_;
+    }
 
     // Give some contexts: "The meaning of life is "
     auto prompt = kPromptMap.at(magic_number_);
     auto prompt_len = prompt.size();
-    for (int i = 0; i < prompt_len; ++i) { x_buff[i] = prompt[i]; }
+    for (int i = 0; i < prompt_len; ++i) {
+        x_buff[i] = prompt[i];
+    }
     std::cout << "The meaning of life is";
 
     auto x = std::make_shared<infini_train::Tensor>(x_tensor.To(device));
-    uint64_t kRngState = kRngState;
+    uint64_t kRngState = infini_train::kRngState;
     LOG(INFO) << "start generate text:";
     for (int t = prompt_len; t < text_length; t++) {
-        /* ===================================== 作业 =====================================
-        TODO：实现单步文本生成逻辑
-        HINT：调用model.Forward推理获取logits，根据推理结果进行随机采样，调用Decode获取文本结果
-        ===================================== 作业 ===================================== */
+        auto results = model.Forward({x});
+        auto logits = results[0];
+
+        int last_time_idx = (t < sequence_length) ? (t - 1) : (sequence_length - 1);
+        auto last_logits = logits->Slice(1, last_time_idx, last_time_idx + 1, 1)->Squeeze(1);
+        auto probs = nn::function::Softmax(last_logits, -1)->To(Device(DeviceType::kCPU, 0));
+        float *probs_ptr = static_cast<float *>(probs.DataPtr());
+
+        for (uint32_t b = 0; b < batch_size; ++b) {
+            float coin_val = RandomF32(kRngState);
+            int next_token = SampleMult(probs_ptr + b * vocab_size_, vocab_size_, coin_val);
+
+            if (b == 0) {
+                std::cout << Decode(next_token);
+                std::cout.flush();
+            }
+
+            if (t < sequence_length) {
+                x_buff[b * sequence_length + t] = next_token;
+            } else {
+                for (int i = 0; i < sequence_length - 1; ++i) {
+                    x_buff[b * sequence_length + i] = x_buff[b * sequence_length + i + 1];
+                }
+                x_buff[b * sequence_length + sequence_length - 1] = next_token;
+            }
+        }
+        x = std::make_shared<infini_train::Tensor>(x_tensor.To(device));
     }
     std::cout << std::endl;
 }
